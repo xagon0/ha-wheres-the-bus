@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Where's the Bus Login",
+        "description": "Enter your Where's the Bus account credentials.",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "subdomain": "Subdomain (e.g., ca, us)",
+          "shard": "Shard ID (e.g., sh_04)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password",
+      "cannot_connect": "Unable to connect to Where's the Bus",
+      "unknown": "An unexpected error occurred"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "eta_minutes": {
+        "name": "{rider_name} Bus ETA"
+      },
+      "eta_time": {
+        "name": "{rider_name} Bus Arrival Time"
+      },
+      "distance": {
+        "name": "{rider_name} Bus Distance"
+      },
+      "bus_status": {
+        "name": "{rider_name} Bus Status"
+      }
+    },
+    "device_tracker": {
+      "bus": {
+        "name": "{rider_name} Bus Location"
+      }
+    }
+  }
+}
