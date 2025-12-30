@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connexion à Where's the Bus",
+        "description": "Entrez vos identifiants de compte Where's the Bus.",
+        "data": {
+          "email": "Courriel",
+          "password": "Mot de passe",
+          "subdomain": "Sous-domaine (ex: ca, us)",
+          "shard": "Identifiant du serveur (ex: sh_04)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Courriel ou mot de passe invalide",
+      "cannot_connect": "Impossible de se connecter à Where's the Bus",
+      "unknown": "Une erreur inattendue s'est produite"
+    },
+    "abort": {
+      "already_configured": "Ce compte est déjà configuré"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "eta_minutes": {
+        "name": "Heure d'arrivée estimée de l'autobus de {rider_name}"
+      },
+      "eta_time": {
+        "name": "Heure d'arrivée de l'autobus de {rider_name}"
+      },
+      "distance": {
+        "name": "Distance de l'autobus de {rider_name}"
+      },
+      "bus_status": {
+        "name": "État de l'autobus de {rider_name}"
+      }
+    },
+    "device_tracker": {
+      "bus": {
+        "name": "Position de l'autobus de {rider_name}"
+      }
+    }
+  }
+}

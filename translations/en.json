@@ -20,5 +20,26 @@
     "abort": {
       "already_configured": "This account is already configured"
     }
+  },
+  "entity": {
+    "sensor": {
+      "eta_minutes": {
+        "name": "{rider_name} Bus ETA"
+      },
+      "eta_time": {
+        "name": "{rider_name} Bus Arrival Time"
+      },
+      "distance": {
+        "name": "{rider_name} Bus Distance"
+      },
+      "bus_status": {
+        "name": "{rider_name} Bus Status"
+      }
+    },
+    "device_tracker": {
+      "bus": {
+        "name": "{rider_name} Bus Location"
+      }
+    }
   }
 }
