@@ -97,11 +97,7 @@ automation:
 
 ## License
 
-<<<<<<< HEAD
 This project is licensed under the Apache License 2.0 - see the [LICENSE.md](LICENSE.md) file for details.
-=======
-This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details.
->>>>>>> origin/release
 
 ## Disclaimer
 

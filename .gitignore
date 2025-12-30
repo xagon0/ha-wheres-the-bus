@@ -24,7 +24,4 @@ logs/
 
 # Local development
 .claude/
-<<<<<<< HEAD
 CLAUDE.md
-=======
->>>>>>> origin/release
