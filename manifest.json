@@ -1,0 +1,12 @@
+{
+  "domain": "wheresthebus",
+  "name": "Where's the Bus",
+  "codeowners": ["@xagon0"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/xagon0/ha-wheres-the-bus",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/xagon0/ha-wheres-the-bus/issues",
+  "requirements": ["aiohttp>=3.8.0", "beautifulsoup4>=4.12.0"],
+  "version": "1.0.1"
+}
