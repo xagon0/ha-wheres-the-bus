@@ -1,5 +1,7 @@
 # Where's the Bus - Home Assistant Integration
 
+<img src="https://raw.githubusercontent.com/xagon0/ha-wheres-the-bus/release/icon.png" alt="Where's the Bus" width="128" align="right">
+
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg)](https://github.com/hacs/integration)
 
 A Home Assistant custom integration for [Where's the Bus](https://wheresthebus.com) school bus tracking. Track your child's school bus location, ETA, and RFID/tablet scan events directly in Home Assistant.

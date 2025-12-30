@@ -13,6 +13,11 @@ from .api import RiderInfo
 from .const import DOMAIN
 
 
+def _stable_rider_id(name: str) -> str:
+    """Generate a stable ID from rider name (lowercased, spaces to underscores)."""
+    return name.lower().replace(" ", "_").replace("'", "")
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -44,11 +49,12 @@ class BusDeviceTracker(CoordinatorEntity[WheresTheBusCoordinator], TrackerEntity
         """Initialize the device tracker."""
         super().__init__(coordinator)
         self._rider = rider
-        # Use student_id for stable identifiers (child_id can change between API sessions)
-        self._attr_unique_id = f"{entry.entry_id}_{rider.student_id}_tracker"
+        # Use rider name for stable identifiers (API IDs can change between sessions)
+        stable_id = _stable_rider_id(rider.name)
+        self._attr_unique_id = f"{entry.entry_id}_{stable_id}_tracker"
         self._attr_name = "Bus Location"
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, f"{entry.entry_id}_{rider.student_id}")},
+            "identifiers": {(DOMAIN, f"{entry.entry_id}_{stable_id}")},
             "name": f"{rider.name} School Bus",
             "manufacturer": "Where's the Bus",
             "model": f"Bus {rider.am_bus_no or rider.pm_bus_no or 'Unknown'}",
