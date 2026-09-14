@@ -13,7 +13,8 @@ A Home Assistant custom integration for [Where's the Bus](https://wheresthebus.c
 - **Distance sensor** showing how far away the bus is
 - **Status sensor** indicating tracking state (tracking, arriving, not_tracking, suspended, offline)
 - **Scan sensor** showing the latest RFID or tablet scan event for your child
-- **Smart polling** that adjusts automatically based on time of day to minimize API calls
+- **Configurable polling windows** in Home Assistant’s local time
+- **Automatic session recovery** and startup retries after temporary service outages
 
 ## Installation
 
@@ -38,8 +39,8 @@ A Home Assistant custom integration for [Where's the Bus](https://wheresthebus.c
 3. Enter your Where's the Bus account credentials:
    - **Email**: Your Where's the Bus login email
    - **Password**: Your Where's the Bus password
-   - **Subdomain** (optional): Region code (default: `ca` for Canada)
-   - **Shard** (optional): Server shard (default: `sh_04`)
+
+The API selects the account’s region and shard automatically. Existing saved credentials are reused.
 
 ## Entities Created
 
@@ -59,10 +60,10 @@ For each rider/student on your account, the following entities are created:
 The integration uses smart polling to reduce API calls:
 
 - **Active (15 seconds)**: During morning and afternoon pickup windows
-- **Idle (5 minutes)**: During school hours between pickup windows
+- **Idle (5 minutes)**: Weekdays from 6 AM to 7 PM outside the active windows
 - **Off (1 hour)**: Overnight and on weekends
 
-Default windows are 7:45-8:45 AM and 1:15-2:15 PM on weekdays.
+Default windows are 7–9 AM and 1–5 PM on weekdays, using Home Assistant’s configured time zone. Change them under the integration’s **Configure** button. Slow polls are shortened at window boundaries so polling starts promptly. Failed scan requests report unavailable instead of “No scans today.”
 
 ## Automations
 
@@ -89,7 +90,7 @@ automation:
 ## Requirements
 
 - An active Where's the Bus account with registered students
-- Home Assistant 2023.1 or newer
+- Tested with Home Assistant 2026.9.2
 
 ## Troubleshooting
 
@@ -103,4 +104,8 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE.md](LIC
 
 ## Disclaimer
 
-This integration is not affiliated with or endorsed by Where's the Bus. It uses web scraping techniques and may break if the Where's the Bus website changes.
+This integration is not affiliated with or endorsed by Where's the Bus. It uses the parent app’s undocumented JSON API, which may change without notice.
+
+## Development
+
+Run regression tests with `python -m pytest -q tests` in an environment with Home Assistant 2026.9.2, pytest, and pytest-asyncio installed. Test fixtures use synthetic account and rider data.

@@ -1,7 +1,7 @@
 """Sensor platform for Where's the Bus integration."""
 from __future__ import annotations
 
-from datetime import datetime
+from homeassistant.util import dt as dt_util
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -17,11 +17,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import WheresTheBusCoordinator
 from .api import RiderInfo
 from .const import DOMAIN
-
-
-def _stable_rider_id(name: str) -> str:
-    """Generate a stable ID from rider name (lowercased, spaces to underscores)."""
-    return name.lower().replace(" ", "_").replace("'", "")
+from .identity import stable_rider_id
 
 
 async def async_setup_entry(
@@ -62,15 +58,15 @@ class WheresTheBusBaseSensor(CoordinatorEntity[WheresTheBusCoordinator], SensorE
         super().__init__(coordinator)
         self._rider = rider
         self._sensor_type = sensor_type
-        # Use rider name for stable identifiers (API IDs can change between sessions)
-        stable_id = _stable_rider_id(rider.name)
+        # Use the student ID, preserving legacy entities during setup.
+        stable_id = stable_rider_id(rider)
         self._attr_unique_id = f"{entry.entry_id}_{stable_id}_{sensor_type}"
         self._attr_device_info = {
             "identifiers": {(DOMAIN, f"{entry.entry_id}_{stable_id}")},
             "name": f"{rider.name} School Bus",
             "manufacturer": "Where's the Bus",
             "model": f"Bus {rider.am_bus_no or rider.pm_bus_no or 'Unknown'}",
-            "sw_version": "1.0",
+            "sw_version": "1.1.0",
         }
 
 
@@ -95,7 +91,7 @@ class BusEtaMinutesSensor(WheresTheBusBaseSensor):
     @property
     def native_value(self) -> int | None:
         """Return the state of the sensor."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         if status:
             return status.eta_minutes
         return None
@@ -103,7 +99,7 @@ class BusEtaMinutesSensor(WheresTheBusBaseSensor):
     @property
     def extra_state_attributes(self) -> dict:
         """Return extra state attributes."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         return {
             "rider_name": self._rider.name,
             "school": self._rider.school,
@@ -113,7 +109,9 @@ class BusEtaMinutesSensor(WheresTheBusBaseSensor):
 
 
 class BusEtaTimeSensor(WheresTheBusBaseSensor):
-    """Sensor for bus arrival time."""
+    """Sensor for bus arrival time calculated from the provider ETA."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
 
     _attr_icon = "mdi:bus-clock"
 
@@ -130,9 +128,9 @@ class BusEtaTimeSensor(WheresTheBusBaseSensor):
     @property
     def native_value(self) -> str | None:
         """Return the state of the sensor."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         if status and status.eta_time:
-            return status.eta_time
+            return dt_util.parse_datetime(status.eta_time)
         return None
 
     @property
@@ -166,7 +164,7 @@ class BusDistanceSensor(WheresTheBusBaseSensor):
     @property
     def native_value(self) -> float | None:
         """Return the state of the sensor."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         if status:
             return status.distance_away
         return None
@@ -174,7 +172,7 @@ class BusDistanceSensor(WheresTheBusBaseSensor):
     @property
     def native_unit_of_measurement(self) -> str:
         """Return the unit of measurement."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         if status and status.distance_unit:
             if status.distance_unit.lower() in ("km", "kilometers"):
                 return UnitOfLength.KILOMETERS
@@ -201,9 +199,13 @@ class BusStatusSensor(WheresTheBusBaseSensor):
     @property
     def native_value(self) -> str:
         """Return the state of the sensor."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         if not status:
             return "unknown"
+        if status.position_age_minutes is not None and status.position_age_minutes >= 5:
+            return "stale"
+        if status.eta_message and "past stop" in status.eta_message.lower():
+            return "past_stop"
         if status.is_tracking:
             if status.eta_minutes is not None and status.eta_minutes <= 2:
                 return "arriving"
@@ -218,7 +220,7 @@ class BusStatusSensor(WheresTheBusBaseSensor):
     @property
     def extra_state_attributes(self) -> dict:
         """Return extra state attributes."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         attrs = {
             "rider_name": self._rider.name,
             "school": self._rider.school,
@@ -233,6 +235,9 @@ class BusStatusSensor(WheresTheBusBaseSensor):
                 "heading": status.heading,
                 "speed": status.speed,
                 "last_update": status.last_update,
+                "last_poll": status.last_poll,
+                "eta_message": status.eta_message,
+                "position_age_minutes": status.position_age_minutes,
             })
         return attrs
 
@@ -253,6 +258,10 @@ class LastScanSensor(WheresTheBusBaseSensor):
         self._attr_name = "Last Scan"
 
     @property
+    def available(self) -> bool:
+        return super().available and self.coordinator.scans_available
+
+    @property
     def native_value(self) -> str | None:
         """Return the state - scan method and time."""
         scan = self.coordinator.get_latest_scan(self._rider.name)
@@ -260,7 +269,7 @@ class LastScanSensor(WheresTheBusBaseSensor):
             return "No scans today"
 
         # Convert timestamp to readable time
-        scan_dt = datetime.fromtimestamp(scan.scan_time)
+        scan_dt = dt_util.as_local(dt_util.utc_from_timestamp(scan.scan_time))
         time_str = scan_dt.strftime("%-I:%M %p")
         return f"{scan.scan_method} at {time_str}"
 
@@ -272,7 +281,7 @@ class LastScanSensor(WheresTheBusBaseSensor):
             "rider_name": self._rider.name,
         }
         if scan:
-            scan_dt = datetime.fromtimestamp(scan.scan_time)
+            scan_dt = dt_util.as_local(dt_util.utc_from_timestamp(scan.scan_time))
             attrs.update({
                 "scan_time": scan_dt.isoformat(),
                 "scan_timestamp": scan.scan_time,
@@ -286,7 +295,7 @@ class LastScanSensor(WheresTheBusBaseSensor):
         if all_scans:
             attrs["scans_today"] = [
                 {
-                    "time": datetime.fromtimestamp(s.scan_time).strftime("%-I:%M %p"),
+                    "time": dt_util.as_local(dt_util.utc_from_timestamp(s.scan_time)).strftime("%-I:%M %p"),
                     "location": s.scan_location,
                     "method": s.scan_method,
                 }

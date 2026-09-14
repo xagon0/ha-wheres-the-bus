@@ -6,9 +6,14 @@
         "description": "Entrez vos identifiants de compte Where's the Bus.",
         "data": {
           "email": "Courriel",
-          "password": "Mot de passe",
-          "subdomain": "Sous-domaine (ex: ca, us)",
-          "shard": "Identifiant du serveur (ex: sh_04)"
+          "password": "Mot de passe"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnecter Where’s the Bus",
+        "description": "Saisissez votre mot de passe pour reconnecter votre compte.",
+        "data": {
+          "password": "Mot de passe"
         }
       }
     },
@@ -40,6 +45,23 @@
       "bus": {
         "name": "Position de l'autobus de {rider_name}"
       }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Heures de suivi actif",
+        "description": "Heures locales de Home Assistant, au format HH:MM.",
+        "data": {
+          "am_start": "Début du matin",
+          "am_end": "Fin du matin",
+          "pm_start": "Début de l’après-midi",
+          "pm_end": "Fin de l’après-midi"
+        }
+      }
+    },
+    "error": {
+      "invalid_window": "Saisissez des heures valides; la fin doit suivre le début."
     }
   }
 }
