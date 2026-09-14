@@ -6,9 +6,14 @@
         "description": "Enter your Where's the Bus account credentials.",
         "data": {
           "email": "Email",
-          "password": "Password",
-          "subdomain": "Subdomain (e.g., ca, us)",
-          "shard": "Shard ID (e.g., sh_04)"
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Where’s the Bus",
+        "description": "Enter your password to reconnect your account.",
+        "data": {
+          "password": "Password"
         }
       }
     },
@@ -40,6 +45,23 @@
       "bus": {
         "name": "{rider_name} Bus Location"
       }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Active tracking hours",
+        "description": "Use Home Assistant local time in HH:MM format.",
+        "data": {
+          "am_start": "Morning start",
+          "am_end": "Morning end",
+          "pm_start": "Afternoon start",
+          "pm_end": "Afternoon end"
+        }
+      }
+    },
+    "error": {
+      "invalid_window": "Enter valid times, with each end later than its start."
     }
   }
 }

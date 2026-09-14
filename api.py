@@ -1,62 +1,69 @@
-"""API client for Where's the Bus."""
+"""Client for the Where's the Bus parent app JSON API."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import re
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
+from urllib.parse import urlsplit, urljoin
+from uuid import uuid4
+from time import monotonic
 
 import aiohttp
-from bs4 import BeautifulSoup
 
-from .const import (
-    LOGIN_URL,
-    RIDER_API_URL_TEMPLATE,
-    RIDER_PAGE_URL_TEMPLATE,
-    SESSION_URL_TEMPLATE,
-    STUDENT_SCANS_URL_TEMPLATE,
-    DEFAULT_SUBDOMAIN,
-    DEFAULT_SHARD,
-)
+from .const import DEFAULT_SHARD, DEFAULT_SUBDOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+LOGIN_API_URL = "https://mdt.wheresthebus.com/wtbparentapp/api/v2/login"
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+
+def normalized_name(name: str) -> str:
+    """Match display names without treating whitespace as identity."""
+    return " ".join(name.casefold().replace("'", "").split())
+
+
+def _number(value: Any) -> float | None:
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
 class RiderInfo:
-    """Information about a rider/student."""
-
     child_id: str
     student_id: str
     name: str
     school: str
-    am_bus_no: str | None
-    am_stop_time: str | None
-    am_stop_address: str | None
-    am_stop_lat: float | None
-    am_stop_lon: float | None
-    pm_bus_no: str | None
-    pm_stop_time: str | None
-    pm_stop_address: str | None
-    pm_stop_lat: float | None
-    pm_stop_lon: float | None
+    am_bus_no: str | None = None
+    am_stop_time: str | None = None
+    am_stop_address: str | None = None
+    am_stop_lat: float | None = None
+    am_stop_lon: float | None = None
+    pm_bus_no: str | None = None
+    pm_stop_time: str | None = None
+    pm_stop_address: str | None = None
+    pm_stop_lat: float | None = None
+    pm_stop_lon: float | None = None
 
 
 @dataclass
 class StudentScan:
-    """A student RFID/tablet scan event."""
-
     student_name: str
-    scan_time: int  # Unix timestamp
+    scan_time: int
     scan_location: str
-    scan_method: str  # "RFID" or "Tablet"
+    scan_method: str
     bus: str
+    student_id: str | None = None
 
 
 @dataclass
 class BusStatus:
-    """Current bus tracking status."""
-
     bus_id: str
     bus_number: str
     is_tracking: bool
@@ -70,477 +77,288 @@ class BusStatus:
     heading: str | None
     speed: float | None
     last_update: str | None
+    eta_message: str | None = None
+    position_age_minutes: float | None = None
+    last_poll: str | None = None
 
 
 class WheresTheBusApiError(Exception):
-    """Base exception for API errors."""
+    """Transport failure or an unexpected provider response."""
 
 
 class WheresTheBusAuthError(WheresTheBusApiError):
-    """Authentication error."""
+    """The saved credentials are no longer accepted."""
 
 
 class WheresTheBusApi:
-    """API client for Where's the Bus."""
-
     def __init__(
-        self,
-        email: str,
-        password: str,
-        subdomain: str = DEFAULT_SUBDOMAIN,
-        shard: str = DEFAULT_SHARD,
+        self, email: str, password: str,
+        subdomain: str = DEFAULT_SUBDOMAIN, shard: str = DEFAULT_SHARD,
         session: aiohttp.ClientSession | None = None,
+        device_id: str | None = None,
     ) -> None:
-        """Initialize the API client."""
         self._email = email
         self._password = password
-        self._subdomain = subdomain
-        self._shard = shard
         self._session = session
         self._owns_session = session is None
-
-        # Session data
-        self._cookies: dict[str, str] = {}
-        self._app_id: str | None = None
-        self._user_guid: str | None = None
+        self._device_id = device_id or f"HomeAssistant_{uuid4()}"
+        # Region and shard are discovered during login; retain constructor
+        # compatibility with existing config entries.
+        self._base_url: str | None = None
+        self._session_id: str | None = None
+        self._auth_lock = asyncio.Lock()
         self._riders: list[RiderInfo] = []
-        self._bus_ids: dict[str, str] = {}  # child_id -> bus_id mapping
+        self._assignments: dict[str, tuple[str, str]] = {}
+        self._assignments_session: str | None = None
+        self._assignments_updated = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the aiohttp session."""
         if self._session is None:
             self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self) -> None:
-        """Close the API client."""
         if self._owns_session and self._session:
             await self._session.close()
             self._session = None
 
-    async def authenticate(self) -> bool:
-        """Authenticate with Where's the Bus."""
-        session = await self._get_session()
-
+    @staticmethod
+    def _trusted_url(url: str) -> bool:
         try:
-            # Step 1: Get login page to extract CSRF token
-            async with session.get(LOGIN_URL) as response:
-                if response.status != 200:
-                    raise WheresTheBusAuthError(f"Failed to get login page: {response.status}")
-                html = await response.text()
+            parsed = urlsplit(url)
+            host = parsed.hostname or ""
+            return (parsed.scheme == "https" and not parsed.username and not parsed.password
+                    and parsed.port in (None, 443)
+                    and any(host == domain or host.endswith("." + domain)
+                            for domain in ("wheresthebus.com", "veonow.com")))
+        except ValueError:
+            return False
 
-            # Extract CSRF token
-            soup = BeautifulSoup(html, "html.parser")
-            token_input = soup.find("input", {"name": "token"})
-            token = token_input.get("value") if token_input else ""
-
-            # Step 2: Submit login form
-            login_data = {
-                "form_id": "login",
-                "success_dest": "https://wheresthebus.com",
-                "email": self._email,
-                "pw": self._password,
-                "stay_logged_in": "stay_logged_in",
-                "commit": "Sign in",
-                "token": token,
-            }
-
-            async with session.post(
-                LOGIN_URL,
-                data=login_data,
-                allow_redirects=False,
-            ) as response:
-                if response.status != 302:
-                    raise WheresTheBusAuthError("Login failed - invalid credentials")
-
-                location = response.headers.get("Location", "")
-                if "session.php" not in location:
-                    raise WheresTheBusAuthError("Login failed - unexpected redirect")
-
-            # Step 3: Follow redirect to establish session (allow full redirect chain)
-            _LOGGER.debug("Following session redirect to: %s", location)
-            async with session.get(location, allow_redirects=True) as response:
-                _LOGGER.debug("Session response status: %s, URL: %s", response.status, response.url)
-                # We should end up at rider.php after all redirects
-                html = await response.text()
-
-                # Extract cookies
-                for cookie in session.cookie_jar:
-                    self._cookies[cookie.key] = cookie.value
-                _LOGGER.debug("Cookies after session: %s", list(self._cookies.keys()))
-
-            # Check if we ended up at the rider page
-            if "rider.php" in str(response.url) or "s_app_id" in html:
-                _LOGGER.debug("Already at rider page from session redirect")
-                self._parse_rider_page(html)
-            else:
-                # Step 4: Get rider page explicitly
-                rider_url = RIDER_PAGE_URL_TEMPLATE.format(
-                    subdomain=self._subdomain,
-                    shard=self._shard,
-                )
-                _LOGGER.debug("Fetching rider page: %s", rider_url)
-
-                async with session.get(rider_url) as response:
+    async def _post(self, url: str, data: dict[str, Any]) -> dict[str, Any]:
+        session = await self._get_session()
+        try:
+            for _ in range(4):
+                if not self._trusted_url(url):
+                    raise WheresTheBusApiError("Provider returned an untrusted API redirect")
+                async with session.post(
+                    url, json=data, timeout=REQUEST_TIMEOUT, allow_redirects=False,
+                ) as response:
+                    if response.status in (307, 308):
+                        destination = urljoin(url, response.headers.get("Location", ""))
+                        if urlsplit(destination).path.rsplit("/", 1)[-1] != urlsplit(url).path.rsplit("/", 1)[-1]:
+                            raise WheresTheBusApiError("Provider redirected to a different API endpoint")
+                        url = destination
+                        continue
                     if response.status != 200:
-                        raise WheresTheBusAuthError(f"Failed to get rider page: {response.status}")
-                    html = await response.text()
-                    _LOGGER.debug("Rider page response URL: %s", response.url)
+                        raise WheresTheBusApiError(f"Provider returned HTTP {response.status}")
+                    result = await response.json(content_type=None)
+                    break
+            else:
+                raise WheresTheBusApiError("Too many provider redirects")
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            # Never log response bodies, passwords, session IDs or login URLs.
+            raise WheresTheBusApiError("Unable to read the provider API response") from err
+        if not isinstance(result, dict) or "resCode" not in result:
+            raise WheresTheBusApiError("Provider returned an invalid API response")
+        return result
 
-                # Parse rider page for configuration
-                self._parse_rider_page(html)
+    @staticmethod
+    def _api_base(payload: dict[str, Any]) -> str:
+        """Use the server's region, limited to HTTPS provider hosts."""
+        parsed = urlsplit(str(payload.get("basePath", "")))
+        host = parsed.hostname or ""
+        if not WheresTheBusApi._trusted_url(str(payload.get("basePath", ""))):
+            raise WheresTheBusApiError("Provider returned an invalid regional API host")
+        shard = str(payload.get("shardId", ""))
+        if not re.fullmatch(r"sh_\d+", shard):
+            raise WheresTheBusApiError("Provider returned an invalid shard")
+        return f"https://{host}/{shard}/wtbparentapp/api/v2/"
 
-            _LOGGER.info("Successfully authenticated with Where's the Bus")
-            return True
+    async def _login(self) -> None:
+        result = await self._post(LOGIN_API_URL, {
+            "emailId": self._email, "password": self._password,
+            "imeiNo": self._device_id, "deviceType": "FlutterWeb",
+            "sso": 0, "deviceOS": "Web_HomeAssistant",
+        })
+        code = str(result["resCode"])
+        if code in ("1", "2", "9"):
+            self._session_id = None
+            raise WheresTheBusAuthError("Where's the Bus rejected the saved login")
+        if code != "0":
+            raise WheresTheBusApiError(f"Login failed (provider code {code})")
+        payload = result.get("payload")
+        if not isinstance(payload, dict) or not payload.get("sessionId"):
+            raise WheresTheBusApiError("Login returned no session")
+        base_url = self._api_base(payload)
+        self._base_url = base_url
+        self._session_id = str(payload["sessionId"])
 
-        except aiohttp.ClientError as err:
-            raise WheresTheBusApiError(f"Connection error: {err}") from err
+    async def _request(self, endpoint: str, data: dict[str, Any] | Callable[[], dict[str, Any]] | None = None) -> dict[str, Any]:
+        if not self._session_id:
+            async with self._auth_lock:
+                if not self._session_id:
+                    await self._login()
+        for attempt in range(2):
+            session_id = self._session_id
+            result = await self._post(self._base_url + endpoint, {
+                **(data() if callable(data) else data or {}), "sessionId": session_id,
+            })
+            code = str(result["resCode"])
+            if code == "0":
+                payload = result.get("payload")
+                if not isinstance(payload, dict):
+                    raise WheresTheBusApiError(f"{endpoint} returned no data")
+                return result
+            if code != "9":
+                raise WheresTheBusApiError(f"{endpoint} failed (provider code {code})")
+            if attempt:
+                raise WheresTheBusApiError("Provider rejected the refreshed session")
+            async with self._auth_lock:
+                if self._session_id == session_id:
+                    await self._login()
+            if endpoint == "getRiderInfoEx":
+                await self.refresh_assignments()
+        raise WheresTheBusApiError("Unable to refresh session")
 
-    def _parse_rider_page(self, html: str) -> None:
-        """Parse the rider page to extract configuration and rider info."""
-        import json
-
-        _LOGGER.debug("Parsing rider page, HTML length: %d", len(html))
-
-        # Check if we got a login page instead
-        if "au_login.php" in html or "Sign in" in html:
-            _LOGGER.warning("Got login page instead of rider page - authentication may have failed")
-            _LOGGER.debug("HTML snippet: %s", html[:500])
-            return
-
-        # Extract app_id
-        app_id_match = re.search(r's_app_id\s*=\s*["\']([^"\']+)["\']', html)
-        if app_id_match:
-            self._app_id = app_id_match.group(1)
-            _LOGGER.debug("Found app_id: %s", self._app_id)
-        else:
-            _LOGGER.warning("Could not find app_id in page")
-
-        # Extract user_guid
-        guid_match = re.search(r'(?:guid|user_guid)\s*=\s*["\']([^"\']+)["\']', html)
-        if guid_match:
-            self._user_guid = guid_match.group(1)
-            _LOGGER.debug("Found user_guid: %s", self._user_guid)
-        else:
-            _LOGGER.warning("Could not find user_guid in page")
-
-        # Extract bus_id and child_id from the loadPage call
-        load_page_match = re.search(
-            r'loadPage\(["\']rider\.php\?bid=([^&]+)&child_id=(\d+)&uid=([^&]+)',
-            html,
-        )
-        if load_page_match:
-            bus_id = load_page_match.group(1)
-            child_id = load_page_match.group(2)
-            self._bus_ids[child_id] = bus_id
-            _LOGGER.debug("Found bus mapping from loadPage: child_id=%s -> bus_id=%s", child_id, bus_id)
-            if not self._user_guid:
-                self._user_guid = load_page_match.group(3)
-        else:
-            _LOGGER.warning("Could not find loadPage call in HTML")
-
-        # Get child_id from var declaration (this is the ID used for API calls)
-        child_id_match = re.search(r"var\s+child_id\s*=\s*['\"](\d+)['\"]", html)
-        bus_id_match = re.search(r"var\s+bus_id\s*=\s*['\"]([^'\"]+)['\"]", html)
-
-        api_child_id = child_id_match.group(1) if child_id_match else None
-        api_bus_id = bus_id_match.group(1) if bus_id_match else None
-
-        _LOGGER.debug("Var declarations: child_id=%s, bus_id=%s", api_child_id, api_bus_id)
-
-        if api_child_id and api_bus_id:
-            self._bus_ids[api_child_id] = api_bus_id
-            _LOGGER.debug("Found var bus mapping: child_id=%s -> bus_id=%s", api_child_id, api_bus_id)
-        else:
-            _LOGGER.warning("Could not find var child_id or bus_id declarations")
-
-        # Extract rider information from the openDeleteRiderDialog JSON
-        # The JSON is already valid, just need to extract it properly
-        # Match JSON that starts with {"  and ends with }
-        rider_json_matches = re.findall(
-            r'openDeleteRiderDialog\((\{".+?\})\)',
-            html,
-        )
-        _LOGGER.debug("Found %d openDeleteRiderDialog matches", len(rider_json_matches))
-
-        self._riders = []
-        for rider_json_str in rider_json_matches:
-            try:
-                # The data is already valid JSON from the server
-                rider_data = json.loads(rider_json_str)
-                _LOGGER.debug("Parsed rider data: %s", rider_data.get("riderName"))
-
-                # Use api_child_id for API calls, studentId is different
-                # If we only have one rider, use the api_child_id
-                effective_child_id = api_child_id if api_child_id else str(rider_data.get("studentId", ""))
-
-                rider = RiderInfo(
-                    child_id=effective_child_id,
-                    student_id=str(rider_data.get("studentId", "")),
-                    name=rider_data.get("riderName", "Unknown"),
-                    school=rider_data.get("schoolName", "Unknown"),
-                    am_bus_no=rider_data.get("amBusNo"),
-                    am_stop_time=rider_data.get("amStopTime"),
-                    am_stop_address=rider_data.get("amStopAddress"),
-                    am_stop_lat=rider_data.get("amStopLat"),
-                    am_stop_lon=rider_data.get("amStopLon"),
-                    pm_bus_no=rider_data.get("pmBusNo"),
-                    pm_stop_time=rider_data.get("pmStopTime"),
-                    pm_stop_address=rider_data.get("pmStopAddress"),
-                    pm_stop_lat=rider_data.get("pmStopLat"),
-                    pm_stop_lon=rider_data.get("pmStopLon"),
-                )
-                self._riders.append(rider)
-                _LOGGER.info("Found rider: %s (child_id=%s, student_id=%s)",
-                            rider.name, rider.child_id, rider.student_id)
-            except json.JSONDecodeError as err:
-                _LOGGER.warning("Failed to parse rider JSON: %s - Raw: %s...", err, rider_json_str[:100])
-            except KeyError as err:
-                _LOGGER.warning("Missing key in rider data: %s", err)
-
-        # Fallback: If no riders found from JSON, create one from the var data
-        if not self._riders and api_child_id:
-            _LOGGER.info("Creating rider from var data (child_id=%s)", api_child_id)
-            # Try to extract rider name from page
-            name_match = re.search(r'<h2[^>]*style="margin:\s*0[^"]*"[^>]*>([^<]+)</h2>\s*<h3[^>]*>([^<]+)</h3>', html)
-            if not name_match:
-                name_match = re.search(r'<h2[^>]*>([^<]+)</h2>\s*<h3[^>]*>([^<]+)</h3>', html)
-            rider_name = name_match.group(1).strip() if name_match else "Unknown Rider"
-            school_name = name_match.group(2).strip() if name_match else "Unknown School"
-
-            bus_num = api_bus_id.lstrip("S") if api_bus_id and api_bus_id.startswith("S") else api_bus_id
-
-            rider = RiderInfo(
-                child_id=api_child_id,
-                student_id=api_child_id,
-                name=rider_name,
-                school=school_name,
-                am_bus_no=bus_num,
-                am_stop_time=None,
-                am_stop_address=None,
-                am_stop_lat=None,
-                am_stop_lon=None,
-                pm_bus_no=bus_num,
-                pm_stop_time=None,
-                pm_stop_address=None,
-                pm_stop_lat=None,
-                pm_stop_lon=None,
-            )
-            self._riders.append(rider)
-
-        _LOGGER.info("Parsed %d riders from page", len(self._riders))
+    async def authenticate(self) -> bool:
+        async with self._auth_lock:
+            await self._login()
+        await self.refresh_riders()
+        await self.refresh_assignments()
+        if not self._riders:
+            raise WheresTheBusApiError("No riders are registered on this account")
+        _LOGGER.info("Authenticated with Where's the Bus; found %d rider(s)", len(self._riders))
+        return True
 
     @property
     def riders(self) -> list[RiderInfo]:
-        """Get list of riders."""
         return self._riders
 
-    async def get_bus_status(self, child_id: str, bus_id: str | None = None, _retry: bool = False) -> BusStatus | None:
-        """Get current bus status for a rider."""
-        session = await self._get_session()
+    async def refresh_riders(self) -> None:
+        result = await self._request("getAllRiders")
+        rows = result["payload"].get("allRiders")
+        if not isinstance(rows, list):
+            raise WheresTheBusApiError("Provider returned an invalid rider list")
+        riders = []
+        for row in rows:
+            student_id = str(row.get("studentId") or "")
+            if not student_id:
+                raise WheresTheBusApiError("Provider returned a rider without an ID")
+            riders.append(RiderInfo(
+                child_id=student_id, student_id=student_id,
+                name=row.get("riderName") or "Unknown Rider",
+                school=row.get("schoolName") or "Unknown School",
+                **{f"{period}_{field}": row.get(f"{period}{key}")
+                   for period in ("am", "pm")
+                   for field, key in (("bus_no", "BusNo"), ("stop_time", "StopTime"),
+                                      ("stop_address", "StopAddress"))},
+                **{f"{period}_stop_{coord}": _number(row.get(f"{period}Stop{coord.title()}"))
+                   for period in ("am", "pm") for coord in ("lat", "lon")},
+            ))
+        self._riders = riders
 
-        if bus_id is None:
-            bus_id = self._bus_ids.get(child_id)
+    async def refresh_assignments(self) -> None:
+        result = await self._request("getUserInfo", {
+            "imeiNo": self._device_id, "versionInstalled": "5.2.0",
+            "deviceType": "FlutterWeb", "deviceOS": "Web_HomeAssistant",
+        })
+        buses = result["payload"].get("childBuses")
+        if not isinstance(buses, list):
+            raise WheresTheBusApiError("Provider returned no bus assignments")
+        assignments = {}
+        for rider in self._riders:
+            routes = {str(r) for r in (rider.am_bus_no, rider.pm_bus_no) if r}
+            matches = [b for b in buses if str(b.get("routeNo")) in routes]
+            if len(matches) > 1:
+                # The parent API exposes the stop time, not the student's name.
+                times = {re.sub(r"[^0-9:]", "", t) for t in (rider.am_stop_time, rider.pm_stop_time) if t}
+                matches = [b for b in matches if re.sub(r"[^0-9:]", "", str(b.get("busTime", ""))) in times]
+            if not matches and len(self._riders) == 1 and len(buses) == 1:
+                matches = buses
+            choices = {(str(b["childId"]), str(b["busNo"])) for b in matches
+                       if b.get("childId") is not None and b.get("busNo")}
+            if len(choices) != 1:
+                raise WheresTheBusApiError("Unable to uniquely match a rider to a bus assignment")
+            assignment = choices.pop()
+            if not assignment[0].isdigit():
+                raise WheresTheBusApiError("Provider returned an invalid tracking ID")
+            assignments[rider.student_id] = assignment
+        self._assignments = assignments
+        self._assignments_session = self._session_id
+        self._assignments_updated = monotonic()
 
-        if not bus_id or not self._app_id:
-            _LOGGER.error("Missing required data for API call: bus_id=%s, app_id=%s",
-                         bus_id, self._app_id)
-            return None
+    async def get_bus_status(self, student_id: str) -> BusStatus:
+        if (self._assignments_session != self._session_id
+                or monotonic() - self._assignments_updated >= 300
+                or student_id not in self._assignments):
+            await self.refresh_assignments()
 
-        api_url = RIDER_API_URL_TEMPLATE.format(
-            subdomain=self._subdomain,
-            shard=self._shard,
-        )
+        def request_data():
+            child_id, bus_id = self._assignments[student_id]
+            return {"bid": bus_id, "chdId": int(child_id), "lastServerTime": 0}
 
-        # The actual API uses sessionId, bid, chdId (not busId, appId, uid)
-        payload = {
-            "sessionId": self._app_id,
-            "bid": bus_id,
-            "chdId": int(child_id),
-        }
+        result = await self._request("getRiderInfoEx", request_data)
+        return self._parse_bus_status(result["payload"], self._assignments[student_id][1], result.get("serverTime"))
 
-        try:
-            async with session.post(api_url, json=payload) as response:
-                if response.status != 200:
-                    _LOGGER.error("API request failed: %s", response.status)
-                    return None
-
-                data = await response.json()
-                _LOGGER.debug("API response: resCode=%s, mesgStr=%s",
-                             data.get("resCode"), data.get("mesgStr"))
-
-                res_code = data.get("resCode")
-
-                if res_code == 9:
-                    # Session expired, need to re-authenticate (but only retry once)
-                    if not _retry:
-                        _LOGGER.info("Session expired, re-authenticating")
-                        await self.authenticate()
-                        return await self.get_bus_status(child_id, bus_id, _retry=True)
-                    else:
-                        _LOGGER.warning("Session still expired after re-auth - this may be normal outside bus hours")
-                        # Return a default "not tracking" status instead of None
-                        return BusStatus(
-                            bus_id=bus_id,
-                            bus_number=bus_id.lstrip("S") if bus_id.startswith("S") else bus_id,
-                            is_tracking=False,
-                            latitude=None,
-                            longitude=None,
-                            eta_minutes=None,
-                            eta_time=None,
-                            distance_away=None,
-                            distance_unit=None,
-                            gps_status="Session unavailable",
-                            heading=None,
-                            speed=None,
-                            last_update=None,
-                        )
-
-                if res_code != 0:
-                    msg = data.get("mesgStr", "Unknown error")
-                    _LOGGER.debug("API returned non-zero code %s: %s", res_code, msg)
-                    # Return a "not tracking" status for non-fatal errors
-                    return BusStatus(
-                        bus_id=bus_id,
-                        bus_number=bus_id.lstrip("S") if bus_id.startswith("S") else bus_id,
-                        is_tracking=False,
-                        latitude=None,
-                        longitude=None,
-                        eta_minutes=None,
-                        eta_time=None,
-                        distance_away=None,
-                        distance_unit=None,
-                        gps_status=msg,
-                        heading=None,
-                        speed=None,
-                        last_update=None,
-                    )
-
-                return self._parse_bus_status(data.get("payload", {}), bus_id)
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error("API request error: %s", err)
-            return None
-
-    def _parse_bus_status(self, payload: dict[str, Any], bus_id: str) -> BusStatus:
-        """Parse bus status from API response."""
-        # Actual API response format:
-        # busLat, busLon - bus coordinates
-        # dist - distance in km
-        # etaMsg - ETA in minutes (string)
-        # stsMsg - status message ("current", etc.)
-        # stsClr - status color
-        # childBuses - list with routeNo, busNo, etc.
-
-        # Get route number from childBuses if available
-        child_buses = payload.get("childBuses", [])
-        route_no = None
-        if child_buses:
-            route_no = child_buses[0].get("routeNo")
-
-        # Parse ETA - it's a string like "13" for 13 minutes
-        eta_str = payload.get("etaMsg", "")
-        eta_minutes = None
-        if eta_str and eta_str.isdigit():
-            eta_minutes = int(eta_str)
-
-        # Determine if tracking based on presence of bus coordinates
-        bus_lat = payload.get("busLat")
-        bus_lon = payload.get("busLon")
-        is_tracking = bus_lat is not None and bus_lon is not None
-
-        # Distance unit - isDistKm flag indicates km vs miles
-        is_km = payload.get("isDistKm", 1) == 1
-        distance_unit = "km" if is_km else "mi"
-
-        # Get last position heading from lst10Min if available
-        heading = None
-        lst10_min = payload.get("lst10Min", [])
-        if lst10_min:
-            heading = lst10_min[-1].get("heading")
-
+    def _parse_bus_status(self, payload: dict[str, Any], bus_id: str, server_time: Any = None) -> BusStatus:
+        bus_lat, bus_lon = _number(payload.get("busLat")), _number(payload.get("busLon"))
+        tracking = (bus_lat is not None and bus_lon is not None
+                    and -90 <= bus_lat <= 90 and -180 <= bus_lon <= 180
+                    and (bus_lat, bus_lon) != (0, 0))
+        gps_status = str(payload.get("stsMsg") or "")
+        age_match = re.search(r"(\d+(?:\.\d+)?)\s*(min|hour|hr|day)", gps_status, re.I)
+        age = None
+        if age_match:
+            age = float(age_match[1]) * {"min": 1, "hour": 60, "hr": 60, "day": 1440}[age_match[2].lower()]
+        has_position = tracking
+        tracking = tracking and (age is None or age < 5) and not any(
+            term in gps_status.lower() for term in ("unavailable", "resumes", "offline"))
+        eta_raw = payload.get("etaMsg")
+        eta = str(eta_raw).strip() if eta_raw is not None else ""
+        eta_minutes = int(eta) if eta.isdigit() else None
+        buses = payload.get("childBuses") or []
+        bus = next((b for b in buses if str(b.get("busNo")) == bus_id), {})
+        if not bus and len(buses) == 1:
+            bus = buses[0]
+        history = payload.get("lst10Min") or []
+        timestamp = _number(server_time)
+        updated = None
+        arrival = None
+        if timestamp:
+            try:
+                updated = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+                if tracking and eta_minutes is not None:
+                    arrival = datetime.fromtimestamp(timestamp + eta_minutes * 60, timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                pass
         return BusStatus(
-            bus_id=bus_id,
-            bus_number=route_no or bus_id.lstrip("S"),
-            is_tracking=is_tracking,
-            latitude=bus_lat,
-            longitude=bus_lon,
-            eta_minutes=eta_minutes,
-            eta_time=None,  # Not provided in this format
-            distance_away=payload.get("dist"),
-            distance_unit=distance_unit,
-            gps_status=payload.get("stsMsg"),
-            heading=heading,
-            speed=None,  # Not provided in this format
-            last_update=None,  # Not provided in this format
+            bus_id=str(bus.get("busNo") or bus_id),
+            bus_number=str(bus.get("routeNo") or bus.get("busNo") or bus_id),
+            is_tracking=tracking, latitude=bus_lat if has_position else None,
+            longitude=bus_lon if has_position else None, eta_minutes=eta_minutes if tracking else None,
+            eta_time=arrival, distance_away=_number(payload.get("dist")),
+            distance_unit="km" if str(payload.get("isDistKm", 1)) == "1" else "mi",
+            gps_status=gps_status,
+            heading=history[-1].get("heading") if history else None,
+            speed=None, last_update=None, last_poll=updated,
+            eta_message=eta or None, position_age_minutes=age,
         )
 
     async def get_student_scans(self) -> list[StudentScan]:
-        """Get student RFID/tablet scan events for today."""
-        session = await self._get_session()
-
-        if not self._user_guid:
-            _LOGGER.warning("No user_guid available for student scans")
-            return []
-
-        scans_url = STUDENT_SCANS_URL_TEMPLATE.format(
-            subdomain=self._subdomain,
-            shard=self._shard,
-        )
-
-        params = {
-            "action": "web_rider",
-            "uid": self._user_guid,
-        }
-
-        import json as json_module
-
-        headers = {
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-        }
-
-        try:
-            async with session.get(scans_url, params=params, headers=headers) as response:
-                if response.status != 200:
-                    _LOGGER.error("Student scans request failed: %s", response.status)
-                    return []
-
-                # Server returns JSON with text/html content-type, so parse as text
-                text = await response.text()
-
-                # Check if it's actually HTML (login page)
-                if text.strip().startswith("<!DOCTYPE") or text.strip().startswith("<html"):
-                    _LOGGER.warning("Student scans returned HTML page - session may have expired")
-                    return []
-
-                try:
-                    data = json_module.loads(text)
-                except json_module.JSONDecodeError as err:
-                    _LOGGER.error("Failed to parse student scans JSON: %s", err)
-                    return []
-
-                if data.get("status") != "true":
-                    _LOGGER.warning("Student scans returned error")
-                    return []
-
-                payload = data.get("data", {}).get("payload", {})
-                student_details = payload.get("studentDetails", [])
-
-                scans = []
-                for student in student_details:
-                    student_name = student.get("studentName", "Unknown")
-                    for scan in student.get("studentScans", []):
-                        scans.append(StudentScan(
-                            student_name=student_name,
-                            scan_time=scan.get("scanTime", 0),
-                            scan_location=scan.get("scanLocation", "Unknown"),
-                            scan_method=scan.get("scanMethod", "Unknown"),
-                            bus=scan.get("bus", "Unknown"),
-                        ))
-
-                return scans
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error("Student scans request error: %s", err)
-            return []
+        result = await self._request("getStudentScan")
+        payload = result["payload"]
+        student_ids = {normalized_name(s.get("full_name", "")): str(s["stud_id"])
+                       for s in payload.get("studentInfo", []) if s.get("stud_id") is not None}
+        scans = []
+        for student in payload.get("studentDetails", []):
+            name = student.get("studentName") or "Unknown"
+            for scan in student.get("studentScans", []):
+                timestamp = _number(scan.get("scanTime"))
+                if timestamp is None or timestamp <= 0:
+                    continue
+                scans.append(StudentScan(
+                    student_name=name, student_id=student_ids.get(normalized_name(name)),
+                    scan_time=int(timestamp), scan_location=scan.get("scanLocation") or "Unknown",
+                    scan_method=scan.get("scanMethod") or "Unknown", bus=str(scan.get("bus") or "Unknown"),
+                ))
+        return scans

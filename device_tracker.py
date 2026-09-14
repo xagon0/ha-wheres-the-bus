@@ -11,11 +11,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import WheresTheBusCoordinator
 from .api import RiderInfo
 from .const import DOMAIN
-
-
-def _stable_rider_id(name: str) -> str:
-    """Generate a stable ID from rider name (lowercased, spaces to underscores)."""
-    return name.lower().replace(" ", "_").replace("'", "")
+from .identity import stable_rider_id
 
 
 async def async_setup_entry(
@@ -49,8 +45,8 @@ class BusDeviceTracker(CoordinatorEntity[WheresTheBusCoordinator], TrackerEntity
         """Initialize the device tracker."""
         super().__init__(coordinator)
         self._rider = rider
-        # Use rider name for stable identifiers (API IDs can change between sessions)
-        stable_id = _stable_rider_id(rider.name)
+        # Use the student ID, preserving legacy entities during setup.
+        stable_id = stable_rider_id(rider)
         self._attr_unique_id = f"{entry.entry_id}_{stable_id}_tracker"
         self._attr_name = "Bus Location"
         self._attr_device_info = {
@@ -58,7 +54,7 @@ class BusDeviceTracker(CoordinatorEntity[WheresTheBusCoordinator], TrackerEntity
             "name": f"{rider.name} School Bus",
             "manufacturer": "Where's the Bus",
             "model": f"Bus {rider.am_bus_no or rider.pm_bus_no or 'Unknown'}",
-            "sw_version": "1.0",
+            "sw_version": "1.1.0",
         }
 
     @property
@@ -69,24 +65,26 @@ class BusDeviceTracker(CoordinatorEntity[WheresTheBusCoordinator], TrackerEntity
     @property
     def latitude(self) -> float | None:
         """Return latitude value of the device."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
-        if status and status.is_tracking:
+        status = self.coordinator.get_bus_status(self._rider.student_id)
+        if status:
             return status.latitude
         return None
 
     @property
     def longitude(self) -> float | None:
         """Return longitude value of the device."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
-        if status and status.is_tracking:
+        status = self.coordinator.get_bus_status(self._rider.student_id)
+        if status:
             return status.longitude
         return None
 
     @property
     def location_name(self) -> str | None:
         """Return a location name for the device."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         if status:
+            if status.position_age_minutes is not None and status.position_age_minutes >= 5:
+                return "Stale Location"
             if not status.is_tracking:
                 return "Not Tracking"
             if status.eta_minutes is not None and status.eta_minutes <= 2:
@@ -96,7 +94,7 @@ class BusDeviceTracker(CoordinatorEntity[WheresTheBusCoordinator], TrackerEntity
     @property
     def extra_state_attributes(self) -> dict:
         """Return extra state attributes."""
-        status = self.coordinator.get_bus_status(self._rider.child_id)
+        status = self.coordinator.get_bus_status(self._rider.student_id)
         attrs = {
             "rider_name": self._rider.name,
             "school": self._rider.school,
@@ -115,5 +113,8 @@ class BusDeviceTracker(CoordinatorEntity[WheresTheBusCoordinator], TrackerEntity
                 "heading": status.heading,
                 "speed": status.speed,
                 "gps_status": status.gps_status,
+                "last_poll": status.last_poll,
+                "eta_message": status.eta_message,
+                "position_age_minutes": status.position_age_minutes,
             })
         return attrs
